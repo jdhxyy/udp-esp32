@@ -125,11 +125,11 @@ static void rxThread(void* param) {
         bufferLen = recvfrom(sock, buffer, UDP_RX_LEN_MAX, 0, 
             (struct sockaddr *)&sourceAddr, &socklen);
 
-        LD(TAG, "receive frame.ip:%d.%d.%d.%d,port:%d", 
+        LD(TAG, "rx frame.ip:%d.%d.%d.%d,port:%d len:%d", 
             (uint8_t)(sourceAddr.sin_addr.s_addr), 
             (uint8_t)(sourceAddr.sin_addr.s_addr >> 8), 
             (uint8_t)(sourceAddr.sin_addr.s_addr >> 16), 
-            (uint8_t)(sourceAddr.sin_addr.s_addr >> 24), sourceAddr.sin_port);
+            (uint8_t)(sourceAddr.sin_addr.s_addr >> 24), sourceAddr.sin_port, bufferLen);
         LaganPrintHex(TAG, LAGAN_LEVEL_DEBUG, buffer, bufferLen);
 
         if (bufferLen <= 0) {
@@ -236,6 +236,11 @@ void UdpTx(uint8_t* bytes, int size, uint32_t ip, uint16_t port) {
     destAddr.sin_addr.s_addr = htonl(ip);
     destAddr.sin_family = AF_INET;
     destAddr.sin_port = htons(port);
+
+    LD(TAG, "tx frame.ip:%d.%d.%d.%d,port:%d len:%d", 
+        (uint8_t)(ip >> 24), (uint8_t)(ip >> 16), (uint8_t)(ip >> 8), (uint8_t)ip, 
+        port, size);
+    LaganPrintHex(TAG, LAGAN_LEVEL_DEBUG, bytes, size);
 
     int err = sendto(sock, bytes, size, 0, (struct sockaddr *)&destAddr, sizeof(destAddr));
     if (err < 0) {
