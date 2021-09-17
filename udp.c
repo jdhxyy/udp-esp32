@@ -142,7 +142,7 @@ static void rxThread(void* param) {
         }
         memcpy(rxBuffer.buffer->buf, buffer, bufferLen);
         rxBuffer.ip = htonl(sourceAddr.sin_addr.s_addr);
-        rxBuffer.port = sourceAddr.sin_port;
+        rxBuffer.port = htons(sourceAddr.sin_port);
         rxBuffer.buffer->len = bufferLen;
     }
     BrorThreadDeleteMe();
