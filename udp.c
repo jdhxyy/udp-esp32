@@ -7,6 +7,7 @@
 #include "lagan.h"
 #include "async.h"
 #include "tzmalloc.h"
+#include "tzfifo.h"
 #include "tzlist.h"
 
 #include "lwip/sockets.h"
@@ -16,7 +17,7 @@
 #define THREAD_SIZE 4096
 
 // tzmalloc字节数
-#define MALLOC_TOTAL 4096
+#define MALLOC_TOTAL 8192
 
 #pragma pack(1)
 
@@ -29,8 +30,7 @@ typedef struct {
 typedef struct {
     uint32_t ip;
     uint16_t port;
-    TZBufferDynamic* buffer;
-} tRxBuffer;
+} tRxTag;
 
 #pragma pack()
 
@@ -45,13 +45,15 @@ static int sock = -1;
 static uint16_t localPort = 0;
 
 // 接收缓存
-static tRxBuffer rxBuffer;
+static intptr_t rxFifo;
+static TZBufferDynamic* buffer;
 
 static int task(void);
 static void notifyObserver(void);
 static void rxThread(void* param);
 static bool isObserverExist(TZNetDataFunc callback);
 static TZListNode* createNode(void);
+static bool udpRxFifoCreate(void);
 
 // UdpLoad 模块载入
 // 载入之前需初始化nvs_flash_init,esp_netif_init,esp_event_loop_create_default
@@ -66,17 +68,23 @@ bool UdpLoad(void) {
         LE(TAG, "load failed!create list failed");
         return false;
     }
-    rxBuffer.buffer = TZMalloc(mid, sizeof(TZBufferDynamic) + UDP_RX_LEN_MAX);
-    if (rxBuffer.buffer == NULL) {
-        LE(TAG, "load failed!malloc rx buffer failed");
-        return false;
-    }
 
     sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
     if (sock < 0) {
         LE(TAG, "bind failed!create socket failed");
         return false;
     }
+
+    buffer = TZMalloc(mid, sizeof(TZBufferDynamic) + UDP_RX_LEN_MAX);
+    if (buffer == NULL) {
+        LE(TAG, "load failed!malloc rx buffer failed");
+        return false;
+    }
+
+    if (udpRxFifoCreate() == false) {
+        return false;
+    }
+
     LI(TAG, "socket created");
 
     AsyncStart(task, ASYNC_NO_WAIT);
@@ -89,8 +97,6 @@ static int task(void) {
 
     PT_BEGIN(&pt);
 
-    PT_WAIT_UNTIL(&pt, rxBuffer.buffer->len > 0);
-
     notifyObserver();
 
     PT_END(&pt);
@@ -99,6 +105,15 @@ static int task(void) {
 static void notifyObserver(void) {
     TZListNode* node = TZListGetHeader(list);
     tItem* item = NULL;
+    static tRxTag tag;
+
+    buffer->len = TZFifoReadMix(rxFifo, (uint8_t *)&tag, sizeof(tRxTag),
+                    buffer->buf, sizeof(tRxTag) + UDP_RX_LEN_MAX + 4);
+
+    if (buffer->len == 0) {
+        return;
+    }
+
     for (;;) {
         if (node == NULL) {
             break;
@@ -106,13 +121,12 @@ static void notifyObserver(void) {
 
         item = (tItem*)node->Data;
         if (item->callback) {
-            item->callback(rxBuffer.buffer->buf, rxBuffer.buffer->len, 
-                rxBuffer.ip, rxBuffer.port);
+            item->callback(buffer->buf, buffer->len,
+                tag.ip, tag.port);
         }
 
         node = node->Next;
     }
-    rxBuffer.buffer->len = 0;
 }
 
 static void rxThread(void* param) {
@@ -120,15 +134,16 @@ static void rxThread(void* param) {
     int bufferLen = 0;
     struct sockaddr_in sourceAddr;
     socklen_t socklen = sizeof(sourceAddr);
+    static tRxTag tag;
 
     while (1) {
-        bufferLen = recvfrom(sock, buffer, UDP_RX_LEN_MAX, 0, 
+        bufferLen = recvfrom(sock, buffer, UDP_RX_LEN_MAX, 0,
             (struct sockaddr *)&sourceAddr, &socklen);
 
-        LD(TAG, "rx frame.ip:%d.%d.%d.%d,port:%d len:%d", 
-            (uint8_t)(sourceAddr.sin_addr.s_addr), 
-            (uint8_t)(sourceAddr.sin_addr.s_addr >> 8), 
-            (uint8_t)(sourceAddr.sin_addr.s_addr >> 16), 
+        LD(TAG, "rx frame.ip:%d.%d.%d.%d,port:%d len:%d",
+            (uint8_t)(sourceAddr.sin_addr.s_addr),
+            (uint8_t)(sourceAddr.sin_addr.s_addr >> 8),
+            (uint8_t)(sourceAddr.sin_addr.s_addr >> 16),
             (uint8_t)(sourceAddr.sin_addr.s_addr >> 24), sourceAddr.sin_port, bufferLen);
         LaganPrintHex(TAG, LAGAN_LEVEL_DEBUG, buffer, bufferLen);
 
@@ -136,14 +151,13 @@ static void rxThread(void* param) {
             LE(TAG, "rx buffer len is wrong:%d", bufferLen);
             continue;
         }
-        if (rxBuffer.buffer->len > 0) {
-            LW(TAG, "deal data is too slow.throw frame!");
+
+        tag.ip = htonl(sourceAddr.sin_addr.s_addr);
+        tag.port = htons(sourceAddr.sin_port);
+        if (TZFifoWriteMix(rxFifo, (uint8_t *)&tag, sizeof(tRxTag), buffer, bufferLen) == false) {
+            LW(TAG, "receive failed!write fifo failed");
             continue;
         }
-        memcpy(rxBuffer.buffer->buf, buffer, bufferLen);
-        rxBuffer.ip = htonl(sourceAddr.sin_addr.s_addr);
-        rxBuffer.port = htons(sourceAddr.sin_port);
-        rxBuffer.buffer->len = bufferLen;
     }
     BrorThreadDeleteMe();
 }
@@ -165,7 +179,7 @@ bool UdpBind(uint16_t port) {
     destAddr.sin_addr.s_addr = htonl(INADDR_ANY);
     destAddr.sin_family = AF_INET;
     destAddr.sin_port = htons(port);
-    
+
     int err = bind(sock, (struct sockaddr *)&destAddr, sizeof(destAddr));
     if (err < 0) {
         LE(TAG, "Socket unable to bind: errno %d", errno);
@@ -237,8 +251,8 @@ void UdpTx(uint8_t* bytes, int size, uint32_t ip, uint16_t port) {
     destAddr.sin_family = AF_INET;
     destAddr.sin_port = htons(port);
 
-    LD(TAG, "tx frame.ip:%d.%d.%d.%d,port:%d len:%d", 
-        (uint8_t)(ip >> 24), (uint8_t)(ip >> 16), (uint8_t)(ip >> 8), (uint8_t)ip, 
+    LD(TAG, "tx frame.ip:%d.%d.%d.%d,port:%d len:%d",
+        (uint8_t)(ip >> 24), (uint8_t)(ip >> 16), (uint8_t)(ip >> 8), (uint8_t)ip,
         port, size);
     LaganPrintHex(TAG, LAGAN_LEVEL_DEBUG, bytes, size);
 
@@ -247,4 +261,14 @@ void UdpTx(uint8_t* bytes, int size, uint32_t ip, uint16_t port) {
         LE(TAG, "Error occurred during sending: errno %d", errno);
         return;
     }
+}
+
+static bool udpRxFifoCreate(void) {
+    // 多4个字节是因为fifo存储混合结构体需增加4字节长度
+    rxFifo = TZFifoCreate(mid, UDP_RX_FIFO_ITEM_SUM, sizeof(tRxTag) + UDP_RX_LEN_MAX + 4);
+    if (rxFifo == 0) {
+        LE(TAG, "create failed!create rx fifo failed");
+        return false;
+    }
+    return true;
 }

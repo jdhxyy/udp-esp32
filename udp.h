@@ -10,6 +10,9 @@
 // UDP接收的最大字节数
 #define UDP_RX_LEN_MAX 1500
 
+// UDP fifo元素数
+#define UDP_RX_FIFO_ITEM_SUM 3
+
 // UdpLoad 模块载入
 // 载入之前需初始化nvs_flash_init,esp_netif_init,esp_event_loop_create_default
 bool UdpLoad(void);
