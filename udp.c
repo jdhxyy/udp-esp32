@@ -1,9 +1,6 @@
-// Copyright 2021-2021 The jdh99 Authors. All rights reserved.
+// Copyright 2021-2023 The jdh99 Authors. All rights reserved.
 // UDP收发模块
 // Authors: jdh99 <jdh821@163.com>
-// FIFO序列号存储的字节流格式:
-// 标识符(4)+IP(4)+PORT(2)+数据长度(2)+数据(N)
-// 帧头:0x20230604
 
 #include "udp.h"
 #include "bror.h"
@@ -15,12 +12,8 @@
 
 #include "lwip/sockets.h"
 
-
 #define TAG "udp"
 #define THREAD_SIZE 4096
-
-// 标志符
-#define MAGIC_WORD 0x20230604
 
 #pragma pack(1)
 
@@ -30,12 +23,9 @@ typedef struct {
 } tItem;
 
 typedef struct {
-    uint32_t magicWord;
     uint32_t ip;
     uint16_t port;
-    uint16_t len;
-    uint8_t data[];
-} tFrame;
+} tRxTag;
 
 #pragma pack()
 
@@ -51,20 +41,21 @@ static uint16_t gLocalPort = 0;
 
 // 接收缓存
 static intptr_t gFifo = 0;
-static tFrame* gFrame = NULL;
+static uint8_t* gTxFrame = NULL;
+static uint8_t* gRxFrame = NULL;
+static int gFrameLenMax = 0;
 
 static int task(void);
 static void notifyObserver(void);
-static bool getFrameHead(int count);
-static void clearFifo(int count);
 static void rxThread(void* param);
 static bool isObserverExist(TZNetDataFunc callback);
 static TZListNode* createNode(void);
 
 // UdpLoad 模块载入
 // 载入之前需初始化nvs_flash_init,esp_netif_init,esp_event_loop_create_default
-bool UdpLoad(void) {
-    gMid = TZMallocRegister(0, TAG, UDP_MALLOC_TOTAL);
+// frameLenMax是最大帧长.fifoSize是接收缓存的大小
+bool UdpLoad(int frameLenMax, int fifoSize) {
+    gMid = TZMallocRegister(0, TAG, frameLenMax * 2 + fifoSize + 1024);
     if (gMid == -1) {
         LE(TAG, "load failed!malloc failed");
         return false;
@@ -81,13 +72,19 @@ bool UdpLoad(void) {
         return false;
     }
 
-    gFrame = TZMalloc(gMid, sizeof(tFrame) + UDP_RX_LEN_MAX);
-    if (gFrame == NULL) {
-        LE(TAG, "load failed!malloc gFrame failed");
+    gFrameLenMax = frameLenMax;
+    gTxFrame = TZMalloc(gMid, frameLenMax);
+    if (gTxFrame == NULL) {
+        LE(TAG, "load failed!malloc gTxFrame failed");
+        return false;
+    }
+    gRxFrame = TZMalloc(gMid, frameLenMax);
+    if (gRxFrame == NULL) {
+        LE(TAG, "load failed!malloc gRxFrame failed");
         return false;
     }
 
-    gFifo = TZFifoCreate(gMid, UDP_RX_FIFO_SIZE, 1);
+    gFifo = KuggisCreate(gMid, fifoSize);
     if (gFifo == 0) {
         LE(TAG, "load failed!create rx fifo failed");
         return false;
@@ -111,30 +108,14 @@ static int task(void) {
 }
 
 static void notifyObserver(void) {
+    tRxTag tag;
+    int rxLen = KuggisRead(gFifo, gRxFrame, gFrameLenMax, (uint8_t*)&tag, sizeof(tRxTag));
+    if (rxLen == 0) {
+        return;
+    }
+
     TZListNode* node = TZListGetHeader(gList);
     tItem* item = NULL;
-
-    // 反序列化读取数据
-    int count = TZFifoReadableItemCount(gFifo);
-    if (count == 0) {
-        return;
-    }
-
-    if (getFrameHead(count) == false) {
-        // 读取头部失败,fifo数据有问题,全部清空
-        LW(TAG, "clear fifo!");
-        clearFifo(count);
-        return;
-    }
-
-    if (gFrame->len == 0) {
-        LW(TAG, "frame len is 0!");
-        return;
-    }
-    if (TZFifoReadBatch(gFifo, (uint8_t*)gFrame->data, gFrame->len, gFrame->len) == false) {
-        LW(TAG, "fifo read batch failed!read data failed!");
-        return;
-    }
 
     for (;;) {
         if (node == NULL) {
@@ -143,87 +124,43 @@ static void notifyObserver(void) {
 
         item = (tItem*)node->Data;
         if (item->callback) {
-            item->callback(gFrame->data, gFrame->len, gFrame->ip, gFrame->port);
+            item->callback(gRxFrame, rxLen, tag.ip, tag.port);
         }
 
         node = node->Next;
     }
 }
 
-static bool getFrameHead(int count) {
-    // 反序列化读取数据
-    if (count < sizeof(tFrame)) {
-        LW(TAG, "fifo data format is wrong.count is too short:%d", count);
-        return false;
-    }
-    if (TZFifoReadBatch(gFifo, (uint8_t*)gFrame, sizeof(tFrame), sizeof(tFrame)) == false) {
-        LE(TAG, "fifo read batch is failed!");
-        return false;
-    }
-    if (gFrame->magicWord != MAGIC_WORD) {
-        LW(TAG, "magic word is wrong:0x%x", gFrame->magicWord);
-        return false;
-    }
-    if (count - sizeof(tFrame) < gFrame->len) {
-        LW(TAG, "count is too short:%d %d", count, gFrame->len);
-        return false;
-    }
-    return true;
-}
-
-static void clearFifo(int count) {
-    int frameSize = sizeof(tFrame) + UDP_RX_LEN_MAX;
-
-    for (;;) {
-        if (count <= frameSize) {
-            TZFifoReadBatch(gFifo, (uint8_t*)gFrame, count, count);
-            break;
-        } else {
-            TZFifoReadBatch(gFifo, (uint8_t*)gFrame, frameSize, frameSize);
-            count -= frameSize;
-        }
-    }
-}
-
 static void rxThread(void* param) {
-    uint8_t buffer[UDP_RX_LEN_MAX] = {0};
-    int bufferLen = 0;
+    int rxLen = 0;
     struct sockaddr_in sourceAddr;
     socklen_t socklen = sizeof(sourceAddr);
-    tFrame* frame = NULL;
     int count = 0;
+    tRxTag tag;
 
-    while (1) {
-        bufferLen = recvfrom(gSock, buffer + sizeof(tFrame), UDP_RX_LEN_MAX - sizeof(tFrame), 0, 
-            (struct sockaddr *)&sourceAddr, &socklen);
-
-        LD(TAG, "rx frame.ip:%d.%d.%d.%d,port:%d len:%d",
-            (uint8_t)(sourceAddr.sin_addr.s_addr),
-            (uint8_t)(sourceAddr.sin_addr.s_addr >> 8),
-            (uint8_t)(sourceAddr.sin_addr.s_addr >> 16),
-            (uint8_t)(sourceAddr.sin_addr.s_addr >> 24), sourceAddr.sin_port, bufferLen);
-        LaganPrintHex(TAG, LAGAN_LEVEL_DEBUG, buffer + sizeof(tFrame), bufferLen);
-
-        if (bufferLen <= 0) {
-            LE(TAG, "rx buffer len is wrong:%d", bufferLen);
+    for (;;) {
+        rxLen = recvfrom(gSock, gRxFrame, gFrameLenMax, 0, (struct sockaddr *)&sourceAddr, &socklen);
+        if (rxLen <= 0) {
+            LE(TAG, "rx buffer len is wrong:%d", rxLen);
             continue;
         }
 
-        // 序列号存储
-        count = TZFifoWriteableItemCount(gFifo);
-        if (count < sizeof(tFrame) + bufferLen) {
-            LW(TAG, "receive failed!fifo is full:%d %d", count, bufferLen);
+        LD(TAG, "rx frame.ip:%d.%d.%d.%d,port:%d len:%d", (uint8_t)(sourceAddr.sin_addr.s_addr), 
+            (uint8_t)(sourceAddr.sin_addr.s_addr >> 8), (uint8_t)(sourceAddr.sin_addr.s_addr >> 16),
+            (uint8_t)(sourceAddr.sin_addr.s_addr >> 24), sourceAddr.sin_port, rxLen);
+        LaganPrintHex(TAG, LAGAN_LEVEL_DEBUG, gRxFrame, rxLen);
+
+        count = KuggisWriteableCount(gFifo);
+        if (count < rxLen) {
+            LW(TAG, "receive failed!fifo is full:%d %d", count, rxLen);
             continue;
         }
 
-        frame = (tFrame*)buffer;
-        frame->magicWord = MAGIC_WORD;
-        frame->ip = htonl(sourceAddr.sin_addr.s_addr);
-        frame->port = htons(sourceAddr.sin_port);
-        frame->len = bufferLen;
+        tag.ip = htonl(sourceAddr.sin_addr.s_addr);
+        tag.port = htons(sourceAddr.sin_port);
 
-        if (TZFifoWriteBatch(gFifo, buffer, sizeof(tFrame) + bufferLen) == false) {
-            LW(TAG, "receive failed!write fifo frame failed!");
+        if (KuggisWrite(gFifo, gRxFrame, rxLen, (uint8_t*)&tag, sizeof(tRxTag)) == false) {
+            LE(TAG, "receive failed!KuggisWrite fail");
             continue;
         }
     }

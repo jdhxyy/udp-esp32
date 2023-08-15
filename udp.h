@@ -1,4 +1,4 @@
-// Copyright 2021-2021 The jdh99 Authors. All rights reserved.
+// Copyright 2021-2023 The jdh99 Authors. All rights reserved.
 // UDP收发模块
 // Authors: jdh99 <jdh821@163.com>
 
@@ -7,18 +7,10 @@
 
 #include "tztype.h"
 
-// UDP接收的最大字节数.包含12字节的序列号帧头长度
-#define UDP_RX_LEN_MAX 1500
-
-// tzmalloc字节数
-#define UDP_MALLOC_TOTAL 10240
-
-// FIFO接收缓存字节数
-#define UDP_RX_FIFO_SIZE 8192
-
 // UdpLoad 模块载入
 // 载入之前需初始化nvs_flash_init,esp_netif_init,esp_event_loop_create_default
-bool UdpLoad(void);
+// frameLenMax是最大帧长.fifoSize是接收缓存的大小
+bool UdpLoad(int frameLenMax, int fifoSize);
 
 // UdpBind 绑定端口
 bool UdpBind(uint16_t port);
