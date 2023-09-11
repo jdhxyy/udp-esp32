@@ -109,7 +109,7 @@ static int task(void) {
 
 static void notifyObserver(void) {
     tRxTag tag;
-    int rxLen = KuggisRead(gFifo, gRxFrame, gFrameLenMax, (uint8_t*)&tag, sizeof(tRxTag));
+    int rxLen = KuggisRead(gFifo, gTxFrame, gFrameLenMax, (uint8_t*)&tag, sizeof(tRxTag));
     if (rxLen == 0) {
         return;
     }
@@ -124,7 +124,7 @@ static void notifyObserver(void) {
 
         item = (tItem*)node->Data;
         if (item->callback) {
-            item->callback(gRxFrame, rxLen, tag.ip, tag.port);
+            item->callback(gTxFrame, rxLen, tag.ip, tag.port);
         }
 
         node = node->Next;
